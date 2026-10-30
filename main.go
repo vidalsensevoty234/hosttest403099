@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -400,14 +401,14 @@ func resolveInfrastructureDomains() (bhDomain, customDomain, nodeHost string) {
 	nodeEnv := cleanHost(getEnv("BOTHOSTING_NODE_HOST", getEnv("BOTHOSTING_NODE_FQDN", getEnv("P_SERVER_LOCATION", ""))))
 
 	for _, candidate := range []string{subEnv, explicitBH} {
-		if isBotHostingPublicDomain(candidate) {
-			bhDomain = candidate
+		if norm := normalizeBHSubdomain(candidate); norm != "" {
+			bhDomain = norm
 			break
 		}
 	}
 
 	for _, candidate := range []string{customEnv, explicitBH, subEnv} {
-		if candidate != "" && !isBotHostingManagedDomain(candidate) {
+		if candidate != "" && !isBotHostingManagedDomain(candidate) && normalizeBHSubdomain(candidate) == "" {
 			customDomain = candidate
 			break
 		}
@@ -499,26 +500,69 @@ func (c *peekedConn) UnderlyingTCPConn() *net.TCPConn {
 	return c.tcp
 }
 
+type dualAcceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+// dualProtocolListener multiplexes TLS 1.3 and plain HTTP on a single port
+// using a non-blocking asynchronous worker pool so slow/idle TCP handshakes
+// never cause Head-of-Line Blocking in the main accept loop.
 type dualProtocolListener struct {
 	net.Listener
 	tlsConfig *tls.Config
+	readyCh   chan dualAcceptResult
+	sem       chan struct{}
+	closeOnce sync.Once
+	closedCh  chan struct{}
 }
 
 func newDualProtocolListener(inner net.Listener, tlsCfg *tls.Config) net.Listener {
 	if tlsCfg == nil {
 		return inner
 	}
-	return &dualProtocolListener{
+	concurrency := 64
+	if isCompactMemoryTier() {
+		concurrency = 32
+	}
+	l := &dualProtocolListener{
 		Listener:  inner,
 		tlsConfig: tlsCfg,
+		readyCh:   make(chan dualAcceptResult, concurrency),
+		sem:       make(chan struct{}, concurrency),
+		closedCh:  make(chan struct{}),
+	}
+	go l.acceptLoop()
+	return l
+}
+
+func (l *dualProtocolListener) acceptLoop() {
+	for {
+		rawConn, err := l.Listener.Accept()
+		if err != nil {
+			select {
+			case <-l.closedCh:
+				return
+			case l.readyCh <- dualAcceptResult{err: err}:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+
+		select {
+		case l.sem <- struct{}{}:
+			go l.inspectAndDispatch(rawConn)
+		case <-l.closedCh:
+			_ = rawConn.Close()
+			return
+		}
 	}
 }
 
-func (l *dualProtocolListener) Accept() (net.Conn, error) {
-	rawConn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
+func (l *dualProtocolListener) inspectAndDispatch(rawConn net.Conn) {
+	defer func() { <-l.sem }()
 
 	var tcpConn *net.TCPConn
 	if tc, ok := rawConn.(*net.TCPConn); ok {
@@ -526,7 +570,11 @@ func (l *dualProtocolListener) Accept() (net.Conn, error) {
 		_ = tc.SetNoDelay(true)
 	}
 
-	br := bufio.NewReaderSize(rawConn, 4096)
+	brSize := 4096
+	if isCompactMemoryTier() {
+		brSize = 2048
+	}
+	br := bufio.NewReaderSize(rawConn, brSize)
 	_ = rawConn.SetReadDeadline(time.Now().Add(firstBytePeekTimeout))
 	hdr, peekErr := br.Peek(1)
 	_ = rawConn.SetReadDeadline(time.Time{})
@@ -537,11 +585,44 @@ func (l *dualProtocolListener) Accept() (net.Conn, error) {
 		tcp:  tcpConn,
 	}
 
+	var finalConn net.Conn = pc
 	if peekErr == nil && len(hdr) == 1 && hdr[0] == 0x16 {
-		return tls.Server(pc, l.tlsConfig), nil
+		finalConn = tls.Server(pc, l.tlsConfig)
 	}
 
-	return pc, nil
+	select {
+	case <-l.closedCh:
+		_ = finalConn.Close()
+	case l.readyCh <- dualAcceptResult{conn: finalConn}:
+	}
+}
+
+func (l *dualProtocolListener) Accept() (net.Conn, error) {
+	select {
+	case res := <-l.readyCh:
+		return res.conn, res.err
+	case <-l.closedCh:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *dualProtocolListener) Close() error {
+	var err error
+	l.closeOnce.Do(func() {
+		close(l.closedCh)
+		err = l.Listener.Close()
+		for {
+			select {
+			case res := <-l.readyCh:
+				if res.conn != nil {
+					_ = res.conn.Close()
+				}
+			default:
+				return
+			}
+		}
+	})
+	return err
 }
 
 func bindDualListeners(listenCfg *net.ListenConfig, primaryPort string, tlsCfg *tls.Config) ([]net.Listener, []string, error) {
@@ -615,7 +696,7 @@ func orchestrateCloudInfrastructure(
 		return
 	}
 
-	bhDomain := cleanHost(initialBH)
+	bhDomain := normalizeBHSubdomain(initialBH)
 	customDomain := cleanHost(initialCF)
 	nodeHost := resolveNodeHostToIP(initialNode)
 	containerPort := initialPort
@@ -641,7 +722,7 @@ func orchestrateCloudInfrastructure(
 	loggedAfterDiscovery := false
 
 	syncDomains := func(newBH, newCF, newNode string, newPort int) {
-		cleanBH := cleanHost(newBH)
+		cleanBH := normalizeBHSubdomain(newBH)
 		cleanCF := cleanHost(newCF)
 		cleanNode := resolveNodeHostToIP(newNode)
 
