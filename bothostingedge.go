@@ -90,6 +90,32 @@ func resolveNodeHostToIP(raw string) string {
 	return clean
 }
 
+// normalizeBHSubdomain converts any Bot-Hosting subdomain representation
+// (e.g. "zl6fx6ulo0.apps", "zl6fx6ulo0", or "https://zl6fx6ulo0.apps.bot-hosting.cloud")
+// into its canonical FQDN ("zl6fx6ulo0.apps.bot-hosting.cloud").
+func normalizeBHSubdomain(raw string) string {
+	clean := cleanHost(raw)
+	if clean == "" || isBotHostingCnameAlias(clean) || isBotHostingNodeHost(clean) || net.ParseIP(clean) != nil {
+		return ""
+	}
+	if isBotHostingPublicDomain(clean) {
+		return clean
+	}
+	if strings.HasSuffix(clean, ".apps") || strings.HasSuffix(clean, ".site") {
+		candidate := clean + ".bot-hosting.cloud"
+		if isBotHostingPublicDomain(candidate) {
+			return candidate
+		}
+	}
+	if !strings.Contains(clean, ".") {
+		candidate := clean + ".apps.bot-hosting.cloud"
+		if isBotHostingPublicDomain(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
 type bhAPIError struct {
 	StatusCode int
 	Code       string `json:"code,omitempty"`
@@ -246,7 +272,7 @@ func NewBotHostingClient(token string) *BotHostingClient {
 		ServiceName:   srvName,
 		TargetPort:    port,
 		apiBase:       apiURL,
-		serviceDomain: bhDom,
+		serviceDomain: normalizeBHSubdomain(bhDom),
 		customDomain:  cfDom,
 		nodeHost:      resolveNodeHostToIP(nodeHost),
 		client: &http.Client{
@@ -340,7 +366,7 @@ func (c *BotHostingClient) SetServiceDomain(d string) {
 	if c == nil {
 		return
 	}
-	clean := cleanHost(d)
+	clean := normalizeBHSubdomain(d)
 	if !isBotHostingPublicDomain(clean) {
 		return
 	}
@@ -552,7 +578,7 @@ func anyToString(v any) string {
 func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 	for _, wrapKey := range []string{"deployment", "data", "server", "attributes"} {
 		if inner, ok := m[wrapKey].(map[string]any); ok && len(inner) > 0 {
-			if _, hasID := inner["id"]; hasID || inner["port"] != nil || inner["domains"] != nil {
+			if _, hasID := inner["id"]; hasID || inner["port"] != nil || inner["domains"] != nil || inner["subdomain"] != nil || inner["canonicalUrl"] != nil {
 				m = inner
 			}
 		}
@@ -621,25 +647,17 @@ func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 	}
 
 	if domMap, ok := m["domains"].(map[string]any); ok {
-		for _, k := range []string{"subdomain", "default", "freeSubdomain", "appDomain", "url"} {
+		for _, k := range []string{"canonicalUrl", "canonical", "subdomain", "default", "freeSubdomain", "appDomain", "url", "alias", "prettyAlias", "slug"} {
 			if s, ok := domMap[k].(string); ok && strings.TrimSpace(s) != "" {
-				cleanSub := cleanHost(s)
-				if !strings.Contains(cleanSub, ".") && cleanSub != "" {
-					cleanSub = cleanSub + ".apps.bot-hosting.cloud"
-				}
-				if isBotHostingPublicDomain(cleanSub) {
-					cand.ServiceDomain = cleanSub
+				if norm := normalizeBHSubdomain(s); norm != "" {
+					cand.ServiceDomain = norm
 					break
 				}
 			} else if subObj, ok := domMap[k].(map[string]any); ok {
-				for _, sk := range []string{"domain", "hostname", "name", "url", "subdomain"} {
+				for _, sk := range []string{"canonicalUrl", "domain", "hostname", "name", "url", "subdomain"} {
 					if ss, ok := subObj[sk].(string); ok && strings.TrimSpace(ss) != "" {
-						cleanSub := cleanHost(ss)
-						if !strings.Contains(cleanSub, ".") && cleanSub != "" {
-							cleanSub = cleanSub + ".apps.bot-hosting.cloud"
-						}
-						if isBotHostingPublicDomain(cleanSub) {
-							cand.ServiceDomain = cleanSub
+						if norm := normalizeBHSubdomain(ss); norm != "" {
+							cand.ServiceDomain = norm
 							break
 						}
 					}
@@ -669,14 +687,13 @@ func parseBHDeploymentMap(m map[string]any) bhDeploymentCandidate {
 		}
 	}
 
-	for _, k := range []string{"subdomain", "publicUrl", "url", "defaultDomain", "domain"} {
+	for _, k := range []string{"canonicalUrl", "canonical", "subdomain", "publicUrl", "url", "defaultDomain", "domain"} {
 		if cand.ServiceDomain != "" {
 			break
 		}
 		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
-			clean := cleanHost(s)
-			if isBotHostingPublicDomain(clean) {
-				cand.ServiceDomain = clean
+			if norm := normalizeBHSubdomain(s); norm != "" {
+				cand.ServiceDomain = norm
 				break
 			}
 		}
@@ -766,6 +783,46 @@ func parseBHCustomDomainMap(m map[string]any, fallbackSubdomain, fallbackNode st
 	return info
 }
 
+func extractSubdomainFromGenericJSON(rawBytes []byte) string {
+	var raw any
+	if err := json.Unmarshal(rawBytes, &raw); err != nil {
+		return ""
+	}
+	var found string
+	var walk func(node any)
+	walk = func(node any) {
+		if found != "" {
+			return
+		}
+		switch v := node.(type) {
+		case map[string]any:
+			for _, k := range []string{"canonicalUrl", "canonical", "subdomain", "appDomain", "freeSubdomain", "url"} {
+				if s, ok := v[k].(string); ok && strings.TrimSpace(s) != "" {
+					if norm := normalizeBHSubdomain(s); norm != "" {
+						found = norm
+						return
+					}
+				}
+			}
+			for _, child := range v {
+				walk(child)
+				if found != "" {
+					return
+				}
+			}
+		case []any:
+			for _, item := range v {
+				walk(item)
+				if found != "" {
+					return
+				}
+			}
+		}
+	}
+	walk(raw)
+	return found
+}
+
 func extractDeploymentsFromGenericJSON(rawBytes []byte) []bhDeploymentCandidate {
 	var raw any
 	if err := json.Unmarshal(rawBytes, &raw); err != nil {
@@ -780,6 +837,9 @@ func extractDeploymentsFromGenericJSON(rawBytes []byte) []bhDeploymentCandidate 
 		key := cand.ID
 		if key == "" && cand.Port > 0 {
 			key = strconv.Itoa(cand.Port)
+		}
+		if key == "" && cand.ServiceDomain != "" {
+			key = cand.ServiceDomain
 		}
 		if key == "" {
 			return
@@ -862,6 +922,12 @@ func (c *BotHostingClient) enrichDeploymentDetails(ctx context.Context, depID st
 		cands := extractDeploymentsFromGenericJSON(raw)
 		if len(cands) > 0 {
 			c.applyCandidateMetadata(cands[0])
+		}
+		if c.GetServiceDomain() == "" {
+			if sub := extractSubdomainFromGenericJSON(raw); sub != "" {
+				c.SetServiceDomain(sub)
+				c.notifyTopology()
+			}
 		}
 	}
 }
@@ -1044,6 +1110,17 @@ func (c *BotHostingClient) PersistMasterKey(ctx context.Context, masterKey strin
 		return true
 	}
 
+	putPayload := map[string]any{
+		"BERMUDA_MASTER_KEY": cleanMK,
+	}
+	if _, _, putErr := doBHRequest(ctx, c, http.MethodPut, envBasePath, putPayload); putErr == nil {
+		c.mu.Lock()
+		c.keyPersisted = true
+		c.mu.Unlock()
+		log.Println("[BotHosting] ✓ BERMUDA_MASTER_KEY set in Bot-Hosting Deployment Environment")
+		return true
+	}
+
 	patchPath := envBasePath + "/BERMUDA_MASTER_KEY"
 	patchPayload := map[string]any{
 		"value":  cleanMK,
@@ -1062,6 +1139,10 @@ func (c *BotHostingClient) PersistMasterKey(ctx context.Context, masterKey strin
 	return false
 }
 
+// EnsureServiceDomain discovers the deployment's free *.apps.bot-hosting.cloud
+// canonical URL, and if Domains are not yet activated on the deployment, invokes
+// the official `deployments.enableDomains` endpoint (`POST /deployments/:id/domains`)
+// to activate HTTPS routing automatically without manual user intervention.
 func (c *BotHostingClient) EnsureServiceDomain(ctx context.Context) (string, error) {
 	if dom := c.GetServiceDomain(); isFullBotHostingServiceDomain(dom) && c.GetNodeHost() != "" {
 		return dom, nil
@@ -1075,54 +1156,55 @@ func (c *BotHostingClient) EnsureServiceDomain(ctx context.Context) (string, err
 
 	c.mu.RLock()
 	depID := c.DeploymentID
-	srvName := c.ServiceName
 	c.mu.RUnlock()
 	if depID == "" {
 		return c.GetServiceDomain(), nil
 	}
 
-	subPrefix := strings.ToLower(strings.TrimSpace(srvName))
-	subPrefix = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, subPrefix)
-	subPrefix = strings.Trim(subPrefix, "-")
-	if len(subPrefix) < 3 {
-		subPrefix = "bermuda-" + strings.ToLower(strings.TrimPrefix(depID, "dep_"))
-	}
-
-	activatePaths := []struct {
+	enablePaths := []struct {
 		method string
 		path   string
-		body   map[string]any
+		body   any
 	}{
 		{
 			method: http.MethodPost,
-			path:   fmt.Sprintf("/deployments/%s/domains/subdomain", url.PathEscape(depID)),
-			body:   map[string]any{"subdomain": subPrefix},
+			path:   fmt.Sprintf("/deployments/%s/domains", url.PathEscape(depID)),
+			body:   map[string]any{},
 		},
 		{
-			method: http.MethodPatch,
-			path:   fmt.Sprintf("/deployments/%s/domains/subdomain", url.PathEscape(depID)),
-			body:   map[string]any{"subdomain": subPrefix, "enabled": true},
+			method: http.MethodPost,
+			path:   fmt.Sprintf("/deployments/%s/domains/enable", url.PathEscape(depID)),
+			body:   map[string]any{},
 		},
 	}
 
-	for _, att := range activatePaths {
-		if raw, _, err := doBHRequest(ctx, c, att.method, att.path, att.body); err == nil && len(raw) > 0 {
+	for _, att := range enablePaths {
+		raw, _, err := doBHRequest(ctx, c, att.method, att.path, att.body)
+		if err != nil {
+			continue
+		}
+		if len(raw) > 0 {
+			if sub := extractSubdomainFromGenericJSON(raw); isFullBotHostingServiceDomain(sub) {
+				c.SetServiceDomain(sub)
+				c.notifyTopology()
+				log.Printf("[BotHosting] ✓ Auto-Activated Free HTTPS Canonical Subdomain via API: %s", sub)
+				return c.GetServiceDomain(), nil
+			}
 			cands := extractDeploymentsFromGenericJSON(raw)
-			if len(cands) > 0 && isBotHostingPublicDomain(cands[0].ServiceDomain) {
+			if len(cands) > 0 && isFullBotHostingServiceDomain(cands[0].ServiceDomain) {
 				c.SetServiceDomain(cands[0].ServiceDomain)
 				c.notifyTopology()
-				log.Printf("[BotHosting] ✓ Activated Free HTTPS Subdomain: %s", cands[0].ServiceDomain)
+				log.Printf("[BotHosting] ✓ Auto-Activated Free HTTPS Canonical Subdomain via API: %s", cands[0].ServiceDomain)
 				return c.GetServiceDomain(), nil
 			}
 		}
+		break
 	}
 
 	c.enrichDeploymentDetails(ctx, depID)
+	if dom := c.GetServiceDomain(); isFullBotHostingServiceDomain(dom) {
+		log.Printf("[BotHosting] ✓ Resolved Free HTTPS Canonical Subdomain: %s", dom)
+	}
 	return c.GetServiceDomain(), nil
 }
 
